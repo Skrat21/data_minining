@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import inspect
 import json
 import time
 from pathlib import Path
@@ -48,6 +49,20 @@ from transformers import (
     WhisperProcessor,
     Seq2SeqTrainer,
     Seq2SeqTrainingArguments,
+)
+
+# Argument names that changed across transformers versions:
+#   TrainingArguments: evaluation_strategy (<=4.40)  ->  eval_strategy (>=4.41)
+#   Trainer:           tokenizer           (<=4.45)  ->  processing_class (>=4.46)
+_EVAL_STRATEGY_KW = (
+    "eval_strategy"
+    if "eval_strategy" in inspect.signature(Seq2SeqTrainingArguments.__init__).parameters
+    else "evaluation_strategy"
+)
+_PROCESSOR_KW = (
+    "processing_class"
+    if "processing_class" in inspect.signature(Seq2SeqTrainer.__init__).parameters
+    else "tokenizer"
 )
 
 from config import TrainConfig, set_seed, print_env_info, RUNS_DIR
@@ -174,7 +189,7 @@ def train(cfg: TrainConfig):
         fp16=cfg.fp16 and torch.cuda.is_available(),
         gradient_checkpointing=cfg.gradient_checkpointing,
         gradient_checkpointing_kwargs={"use_reentrant": False} if cfg.gradient_checkpointing else None,
-        eval_strategy="steps",
+        **{_EVAL_STRATEGY_KW: "steps"},
         eval_steps=cfg.eval_steps,
         save_strategy="steps",
         save_steps=cfg.save_steps,
@@ -205,7 +220,7 @@ def train(cfg: TrainConfig):
         eval_dataset=eval_dataset,
         data_collator=data_collator,
         compute_metrics=compute_metrics_factory(processor, cfg),
-        processing_class=processor.feature_extractor,
+        **{_PROCESSOR_KW: processor.feature_extractor},
     )
 
     # Train
