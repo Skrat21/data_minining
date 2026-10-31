@@ -28,12 +28,24 @@ Changes vs. the original:
 
 from __future__ import annotations
 
+import os
+import sys
+
+# --smoke must be known BEFORE config is imported: it redirects runs/ and results/
+# to runs_smoke/ and results_smoke/ so real runs are never touched.
+if "--smoke" in sys.argv:
+    os.environ["SMOKE_TEST"] = "1"
+
 import argparse
 import json
-import sys
 from pathlib import Path
 
 from config import TrainConfig, MANIFEST_DIR, RESULTS_DIR, RUNS_DIR, print_env_info
+
+# Set by --smoke (None = normal full run)
+EVAL_LIMIT = None    # evaluate only the first N test utterances
+SCORE_LIMIT = None   # score only the first N training utterances
+MAX_FLAGGED = None   # keep at most N flagged utterances
 
 
 def verify_data(dataset: str):
@@ -66,6 +78,7 @@ def run_zero_shot(dataset: str, model: str):
         dataset=dataset,
         split="test",
         output_dir=out_dir,
+        limit=EVAL_LIMIT,
     )
     return out_dir
 
@@ -96,6 +109,7 @@ def run_a0(dataset: str, model: str, seed: int, **kwargs):
         dataset=dataset,
         split="test",
         output_dir=eval_dir,
+        limit=EVAL_LIMIT,
     )
     return model_path
 
@@ -111,6 +125,8 @@ def run_scoring(dataset: str, model_path: str):
     summary = score_training_set(
         model_path=model_path,
         dataset=dataset,
+        limit=SCORE_LIMIT,
+        max_flagged=MAX_FLAGGED,
     )
 
     # Check the gate
@@ -153,6 +169,7 @@ def run_a1(dataset: str, model: str, seed: int, **kwargs):
         dataset=dataset,
         split="test",
         output_dir=eval_dir,
+        limit=EVAL_LIMIT,
     )
 
 
@@ -188,6 +205,7 @@ def run_a2(dataset: str, model: str, seeds: list[int], **kwargs):
             dataset=dataset,
             split="test",
             output_dir=eval_dir,
+            limit=EVAL_LIMIT,
         )
 
 
@@ -240,7 +258,8 @@ def compare_arms(dataset: str):
 def main():
     parser = argparse.ArgumentParser(description="Run the full Phase 2 experiment")
     parser.add_argument("--dataset", type=str, default="cv", choices=["cv", "mgb2"])
-    parser.add_argument("--model", type=str, default="openai/whisper-small")
+    parser.add_argument("--model", type=str, default=None,
+                        help="default: openai/whisper-small (openai/whisper-tiny with --smoke)")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--start-step", type=int, default=1,
                         help="Resume from this step (1=verify, 5=zero-shot, 6=A0, 7=score, 8=A1, 9=A2, 12=compare)")
@@ -251,7 +270,18 @@ def main():
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--eval-batch-size", type=int, default=16)
     parser.add_argument("--grad-accum", type=int, default=4)
+    parser.add_argument("--smoke", action="store_true",
+                        help="Tiny end-to-end test (whisper-tiny, 48 train clips, 4 steps, 16 test clips). "
+                             "Writes to runs_smoke/ and results_smoke/ only.")
     args = parser.parse_args()
+
+    global EVAL_LIMIT, SCORE_LIMIT, MAX_FLAGGED
+    if args.model is None:
+        args.model = "openai/whisper-tiny" if args.smoke else "openai/whisper-small"
+    if args.smoke:
+        EVAL_LIMIT, SCORE_LIMIT, MAX_FLAGGED = 16, 48, 8
+        print("\n*** SMOKE TEST: tiny data, tiny model. The WER numbers are meaningless; "
+              "this only checks that every step runs. Outputs go to runs_smoke/ and results_smoke/. ***")
 
     print_env_info()
 
@@ -267,6 +297,18 @@ def main():
     extra["gradient_accumulation_steps"] = args.grad_accum
     if args.freeze_encoder:
         extra["freeze_encoder"] = True
+    if args.smoke:
+        extra.update(
+            num_epochs=1,
+            max_steps=4,
+            eval_steps=2,
+            save_steps=2,
+            dev_subset_size=16,
+            max_train_samples=48,
+            per_device_train_batch=2,
+            per_device_eval_batch=4,
+            gradient_accumulation_steps=1,
+        )
 
     step = args.start_step
 
@@ -288,17 +330,29 @@ def main():
         run_a1(args.dataset, args.model, args.seed, **extra)
 
     if step <= 9:
-        run_a2(args.dataset, args.model, [0, 1, 2], **extra)
+        run_a2(args.dataset, args.model, [0] if args.smoke else [0, 1, 2], **extra)
 
     if step <= 12:
         compare_arms(args.dataset)
 
     # Run analysis
     from analyze_flagged import analyze
-    analyze(args.dataset)
+    if args.smoke:
+        # With 48 utterances the statistical models in the analysis can legitimately fail
+        # (too few samples per class), so a failure here is reported, not fatal.
+        try:
+            analyze(args.dataset)
+        except Exception as e:  # noqa: BLE001
+            import traceback
+            traceback.print_exc()
+            print(f"\n[smoke] analysis step failed at tiny scale ({type(e).__name__}). "
+                  "This is expected with 48 utterances unless the error is an ImportError.")
+    else:
+        analyze(args.dataset)
 
     print("\n" + "=" * 70)
-    print("EXPERIMENT COMPLETE")
+    print("SMOKE TEST COMPLETE - every step ran. Safe to start the real run." if args.smoke
+          else "EXPERIMENT COMPLETE")
     print("=" * 70)
 
 

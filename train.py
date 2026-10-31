@@ -186,6 +186,7 @@ def train(cfg: TrainConfig):
         learning_rate=cfg.learning_rate,
         warmup_ratio=cfg.warmup_ratio,
         num_train_epochs=cfg.num_epochs,
+        max_steps=cfg.max_steps,  # -1 = use num_train_epochs; >0 only for smoke tests
         fp16=cfg.fp16 and torch.cuda.is_available(),
         gradient_checkpointing=cfg.gradient_checkpointing,
         gradient_checkpointing_kwargs={"use_reentrant": False} if cfg.gradient_checkpointing else None,

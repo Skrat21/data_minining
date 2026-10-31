@@ -33,7 +33,7 @@ from typing import Optional
 import numpy as np
 import torch
 
-from config import MANIFEST_DIR, RESULTS_DIR, set_seed
+from config import MANIFEST_DIR, RESULTS_DIR, SMOKE, set_seed
 from data_loader import load_manifest, filter_manifest
 from evaluate_model import (
     compute_per_utterance_metrics,
@@ -56,6 +56,7 @@ def score_training_set(
     fp16: bool = True,
     limit: Optional[int] = None,
     reuse_hyps: bool = False,
+    max_flagged: Optional[int] = None,
 ) -> dict:
     """
     Score the training set with the A0 model.
@@ -78,7 +79,9 @@ def score_training_set(
         records = records[:limit]
     print(f"Scoring {len(records)} training utterances...")
 
-    out_dir = RESULTS_DIR / (f"{dataset}_scoring_smoketest" if limit else f"{dataset}_scoring")
+    # --limit smoke tests get their own folder, except under run_experiment.py --smoke,
+    # where RESULTS_DIR is already the isolated results_smoke/ and later steps read cv_scoring.
+    out_dir = RESULTS_DIR / (f"{dataset}_scoring_smoketest" if (limit and not SMOKE) else f"{dataset}_scoring")
     out_dir.mkdir(parents=True, exist_ok=True)
     cache_path = out_dir / "train_hyps_cache.json"
 
@@ -130,6 +133,13 @@ def score_training_set(
             flagged_ids.append(r["id"])
             if min_ref_words > 0 and r["ref_words"] >= min_ref_words:
                 flagged_ids_min_words.append(r["id"])
+
+    if max_flagged is not None:
+        # smoke tests only: a barely-trained model flags almost everything, which would
+        # leave A1 with no training data
+        flagged_ids = flagged_ids[:max_flagged]
+        flagged_ids_min_words = flagged_ids_min_words[:max_flagged]
+        print(f"[smoke] keeping at most {max_flagged} flagged utterances")
 
     flagged_hours = sum(
         rec_by_id[uid]["duration"] for uid in flagged_ids if uid in rec_by_id

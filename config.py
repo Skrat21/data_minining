@@ -34,8 +34,11 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 DATA_DIR = PROJECT_ROOT / "arabic_data"
 AUDIO_DIR = DATA_DIR / "audio"
 MANIFEST_DIR = DATA_DIR / "manifests"
-RUNS_DIR = PROJECT_ROOT / "runs"
-RESULTS_DIR = PROJECT_ROOT / "results"
+# Smoke-test mode (python run_experiment.py --smoke): everything is written to
+# runs_smoke/ and results_smoke/ so real runs and results are never touched.
+SMOKE = os.environ.get("SMOKE_TEST") == "1"
+RUNS_DIR = PROJECT_ROOT / ("runs_smoke" if SMOKE else "runs")
+RESULTS_DIR = PROJECT_ROOT / ("results_smoke" if SMOKE else "results")
 
 
 # ---------------------------------------------------------------------------
@@ -83,6 +86,8 @@ class TrainConfig:
     min_audio_duration: float = 0.5
     max_audio_duration: float = 30.0
     removed_ids_file: Optional[str] = None  # for A1/A2: path to file listing IDs to remove
+    max_train_samples: int = 0              # 0 = use all; N = first N utterances (smoke tests)
+    max_steps: int = -1                     # -1 = train for num_epochs; N = stop after N steps (smoke tests)
     dataloader_num_workers: int = 0         # keep 0 on Windows
 
     # --- I/O ---

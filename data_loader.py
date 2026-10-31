@@ -237,10 +237,16 @@ def get_train_dataset(cfg: TrainConfig, processor: WhisperProcessor) -> WhisperA
 
     records = filter_manifest(
         records,
-        removed_ids=removed_ids,
         min_dur=cfg.min_audio_duration,
         max_dur=cfg.max_audio_duration,
     )
+    # Smoke tests: keep only the first N utterances. Done BEFORE removing the
+    # flagged / random IDs so A0, A1 and A2 all start from the same subset.
+    if cfg.max_train_samples and cfg.max_train_samples > 0:
+        records = records[: cfg.max_train_samples]
+        print(f"[smoke] using only the first {len(records)} training utterances")
+    if removed_ids:
+        records = [r for r in records if r["id"] not in removed_ids]
     print(f"Training set: {len(records)} utterances")
     total_hours = sum(r["duration"] for r in records) / 3600
     print(f"Training hours: {total_hours:.2f} h")
