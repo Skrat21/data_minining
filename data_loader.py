@@ -4,7 +4,26 @@ data_loader.py - Load and prepare datasets for Whisper fine-tuning.
 
 Reads JSONL manifests, converts audio to Whisper features, and returns
 HuggingFace-compatible datasets for training and evaluation.
+
+Changes vs. the original:
+  - WhisperDataCollator FIXED (this matters a lot):
+      * the old collator masked every label equal to pad_token_id. For Whisper,
+        pad == eos == bos == <|endoftext|>, so the real end-of-text token of
+        every utterance was masked too -> the model was never trained to stop
+        generating (runaway / repeating outputs, very slow evaluation).
+      * the old "strip start token" check compared against bos_token_id
+        (<|endoftext|>) instead of <|startoftranscript|>, so it never fired and
+        the decoder saw [SOT, SOT, lang, ...] during training.
+    The new collator pads manually with -100 (never touches a real token) and
+    strips the leading <|startoftranscript|> (the model re-adds it itself).
+  - load_audio_16k(): mono down-mix + resample only when needed (audio in the
+    manifests is already 16 kHz mono, so normally this is just a file read)
+  - label sequences are truncated to Whisper's 448-token decoder limit
+  - np.stack/from_numpy instead of torch.tensor(np.array(...)) (one less copy)
+
+NOTE: models trained with the OLD collator should be retrained.
 """
+
 from __future__ import annotations
 
 import json
@@ -17,10 +36,17 @@ import numpy as np
 import soundfile as sf
 import torch
 from torch.utils.data import Dataset
-from transformers import WhisperFeatureExtractor, WhisperTokenizer, WhisperProcessor
+from transformers import WhisperProcessor
 
 from config import MANIFEST_DIR, TrainConfig
 
+SAMPLE_RATE = 16000
+MAX_LABEL_LEN = 448  # Whisper decoder max_target_positions
+
+
+# ---------------------------------------------------------------------------
+# Manifests
+# ---------------------------------------------------------------------------
 
 def load_manifest(path: str | Path) -> list[dict]:
     """Load a JSONL manifest file."""
@@ -73,13 +99,36 @@ def subsample_manifest(
     return rng.sample(records, n)
 
 
+# ---------------------------------------------------------------------------
+# Audio
+# ---------------------------------------------------------------------------
+
+def load_audio_16k(path: str, target_sr: int = SAMPLE_RATE) -> np.ndarray:
+    """Read an audio file as float32 mono at 16 kHz.
+
+    The data pipeline already stores 16 kHz mono files, so resampling is
+    normally skipped; it is kept as a safety net for foreign files.
+    """
+    audio, sr = sf.read(path, dtype="float32")
+    if audio.ndim > 1:  # stereo -> mono
+        audio = audio.mean(axis=1)
+    if sr != target_sr:
+        audio = librosa.resample(audio, orig_sr=sr, target_sr=target_sr)
+    return audio
+
+
+# ---------------------------------------------------------------------------
+# Dataset / collator
+# ---------------------------------------------------------------------------
+
 class WhisperASRDataset(Dataset):
     """
     PyTorch dataset for Whisper fine-tuning.
 
     Each item returns:
       - input_features: mel spectrogram (from WhisperFeatureExtractor)
-      - labels: tokenized text (from WhisperTokenizer)
+      - labels: tokenized text, INCLUDING the <|startoftranscript|> prefix and
+        the final <|endoftext|> (the collator strips the SOT)
     """
 
     def __init__(
@@ -97,7 +146,7 @@ class WhisperASRDataset(Dataset):
         self.language = language
         self.task = task
         self.max_audio_duration = max_audio_duration
-        self.sr = 16000  # Whisper expects 16 kHz
+        self.sr = SAMPLE_RATE  # Whisper expects 16 kHz
 
         # Set the tokenizer's language and task
         self.tokenizer.set_prefix_tokens(language=language, task=task)
@@ -107,26 +156,24 @@ class WhisperASRDataset(Dataset):
 
     def __getitem__(self, idx):
         rec = self.records[idx]
-        audio_path = rec["audio_filepath"]
         text = rec["text_norm"]
 
-        # Load audio
-        audio, sr = sf.read(audio_path, dtype="float32")
-        if sr != self.sr:
-            audio = librosa.resample(audio, orig_sr=sr, target_sr=self.sr)
+        audio = load_audio_16k(rec["audio_filepath"], self.sr)
 
         # Truncate to max duration
         max_samples = int(self.max_audio_duration * self.sr)
         if len(audio) > max_samples:
             audio = audio[:max_samples]
 
-        # Extract mel features
+        # Mel features (80 x 3000 for whisper-small, padded to 30 s)
         input_features = self.feature_extractor(
             audio, sampling_rate=self.sr, return_tensors="np"
         ).input_features[0]
 
-        # Tokenize text
+        # Tokenize text: [SOT, lang, task, notimestamps, ...text..., EOT]
         labels = self.tokenizer(text).input_ids
+        if len(labels) > MAX_LABEL_LEN:
+            labels = labels[: MAX_LABEL_LEN - 1] + [self.tokenizer.eos_token_id]
 
         return {
             "input_features": input_features,
@@ -139,41 +186,43 @@ class WhisperDataCollator:
     """
     Data collator for Whisper fine-tuning.
 
-    Pads labels to the same length (with -100 for loss masking).
-    Input features are already 30s padded by the feature extractor.
+    - stacks the (already 30 s padded) input features
+    - right-pads labels with -100 (ignored by the loss). Padding is done by
+      hand so that real tokens - in particular the final <|endoftext|> - are
+      NEVER masked.
+    - strips the leading <|startoftranscript|> if every sequence has it; the
+      model prepends decoder_start_token_id (= SOT) itself when it shifts the
+      labels right.
     """
 
     def __init__(self, processor: WhisperProcessor):
         self.processor = processor
+        tok = processor.tokenizer
+        self.sot_id = tok.convert_tokens_to_ids("<|startoftranscript|>")
 
     def __call__(self, features):
-        # Stack input features
-        input_features = torch.tensor(
-            np.array([f["input_features"] for f in features]),
-            dtype=torch.float32,
-        )
+        input_features = torch.from_numpy(
+            np.stack([f["input_features"] for f in features])
+        ).float()
 
-        # Pad labels
-        label_features = [{"input_ids": f["labels"]} for f in features]
-        batch = self.processor.tokenizer.pad(
-            label_features,
-            return_tensors="pt",
-            padding=True,
-        )
-        labels = batch["input_ids"]
-        # Replace padding token id with -100 so it's ignored in loss
-        labels = labels.masked_fill(
-            labels == self.processor.tokenizer.pad_token_id, -100
-        )
-        # If BOS token is at the start, mask it too (Whisper uses decoder_start_token_id)
-        if (labels[:, 0] == self.processor.tokenizer.bos_token_id).all():
-            labels[:, 0] = -100
+        max_len = max(len(f["labels"]) for f in features)
+        labels = torch.full((len(features), max_len), -100, dtype=torch.long)
+        for i, f in enumerate(features):
+            ids = torch.as_tensor(f["labels"], dtype=torch.long)
+            labels[i, : len(ids)] = ids
+
+        if (labels[:, 0] == self.sot_id).all():
+            labels = labels[:, 1:]
 
         return {
             "input_features": input_features,
             "labels": labels,
         }
 
+
+# ---------------------------------------------------------------------------
+# Dataset factories
+# ---------------------------------------------------------------------------
 
 def get_train_dataset(cfg: TrainConfig, processor: WhisperProcessor) -> WhisperASRDataset:
     """Load the training dataset based on config."""
@@ -195,6 +244,7 @@ def get_train_dataset(cfg: TrainConfig, processor: WhisperProcessor) -> WhisperA
     print(f"Training set: {len(records)} utterances")
     total_hours = sum(r["duration"] for r in records) / 3600
     print(f"Training hours: {total_hours:.2f} h")
+
     return WhisperASRDataset(records, processor, cfg.language, cfg.task, cfg.max_audio_duration)
 
 
@@ -211,9 +261,10 @@ def get_eval_dataset(
         min_dur=cfg.min_audio_duration,
         max_dur=cfg.max_audio_duration,
     )
+
     # Subsample dev for faster eval during training
     if split == "dev" and cfg.dev_subset_size > 0:
         records = subsample_manifest(records, cfg.dev_subset_size, cfg.seed)
+
     print(f"{split.capitalize()} set: {len(records)} utterances")
     return WhisperASRDataset(records, processor, cfg.language, cfg.task, cfg.max_audio_duration)
-

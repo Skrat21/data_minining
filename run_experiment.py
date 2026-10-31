@@ -12,15 +12,20 @@ Orchestrates all steps in order:
   7. Compare all arms (Step 12)
 
 Usage:
-  # Run everything from scratch
-  python run_experiment.py --dataset cv --model openai/whisper-small
+    # Run everything from scratch
+    python run_experiment.py --dataset cv --model openai/whisper-small
 
-  # Resume from a specific step
-  python run_experiment.py --dataset cv --start-step 4
+    # Resume from a specific step
+    python run_experiment.py --dataset cv --start-step 4
 
-  # Pilot with whisper-base
-  python run_experiment.py --dataset cv --model openai/whisper-base --pilot
+    # Pilot with whisper-base
+    python run_experiment.py --dataset cv --model openai/whisper-base --pilot
+
+Changes vs. the original:
+  - --freeze-encoder is now passed on to TrainConfig (it was parsed but ignored)
+  - new --eval-batch-size (dev-set evaluation during training)
 """
+
 from __future__ import annotations
 
 import argparse
@@ -244,8 +249,8 @@ def main():
     parser.add_argument("--freeze-encoder", action="store_true",
                         help="Freeze encoder to save VRAM")
     parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--eval-batch-size", type=int, default=16)
     parser.add_argument("--grad-accum", type=int, default=4)
-
     args = parser.parse_args()
 
     print_env_info()
@@ -258,7 +263,10 @@ def main():
         extra["save_steps"] = 100
         extra["dev_subset_size"] = 100
     extra["per_device_train_batch"] = args.batch_size
+    extra["per_device_eval_batch"] = args.eval_batch_size
     extra["gradient_accumulation_steps"] = args.grad_accum
+    if args.freeze_encoder:
+        extra["freeze_encoder"] = True
 
     step = args.start_step
 
@@ -296,4 +304,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

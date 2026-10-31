@@ -4,13 +4,21 @@ config.py - Central configuration for Phase 2 Whisper fine-tuning.
 
 All hyperparameters, paths, and settings live here. Individual scripts
 import from this module rather than hard-coding values.
+
+Changes vs. the original:
+  - print_env_info(): fixed `total_mem` -> `total_memory` (the old attribute
+    does not exist and crashed on GPU machines)
+  - TrainConfig: new fields `per_device_eval_batch`, `freeze_encoder`,
+    `dataloader_num_workers` (old YAML configs still load: unknown keys are
+    ignored, missing keys take the defaults below)
 """
+
 from __future__ import annotations
 
 import os
 import random
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -18,16 +26,17 @@ import numpy as np
 import torch
 import yaml
 
-
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
+
 PROJECT_ROOT = Path(__file__).resolve().parent
 DATA_DIR = PROJECT_ROOT / "arabic_data"
 AUDIO_DIR = DATA_DIR / "audio"
 MANIFEST_DIR = DATA_DIR / "manifests"
 RUNS_DIR = PROJECT_ROOT / "runs"
 RESULTS_DIR = PROJECT_ROOT / "results"
+
 
 # ---------------------------------------------------------------------------
 # Default hyperparameters
@@ -38,25 +47,26 @@ class TrainConfig:
     """All settings for one fine-tuning run."""
 
     # --- identity ---
-    dataset: str = "cv"                    # "cv" or "mgb2"
-    arm: str = "A0"                        # A0 / A1 / A2 / A3 / A4
+    dataset: str = "cv"            # "cv" or "mgb2"
+    arm: str = "A0"                # A0 / A1 / A2 / A3 / A4
     seed: int = 42
-    run_tag: str = ""                      # auto-generated if empty
+    run_tag: str = ""              # auto-generated if empty
 
     # --- model ---
     model_name: str = "openai/whisper-small"
     language: str = "ar"
     task: str = "transcribe"
+    freeze_encoder: bool = False   # freeze encoder to save VRAM (was a no-op flag before)
 
     # --- training ---
     learning_rate: float = 1e-5
     warmup_ratio: float = 0.05
     num_epochs: int = 3
-    per_device_train_batch: int = 4        # lower for 4 GB VRAM
-    gradient_accumulation_steps: int = 4   # effective batch = 4 * 4 = 16
+    per_device_train_batch: int = 4   # lower for 4 GB VRAM
+    gradient_accumulation_steps: int = 4  # effective batch = 4 * 4 = 16
     fp16: bool = True
     gradient_checkpointing: bool = True
-    optim: str = "adamw_torch"             # or "adamw_bnb_8bit" to save memory
+    optim: str = "adamw_torch"     # or "adamw_bnb_8bit" to save memory
     weight_decay: float = 0.01
     max_grad_norm: float = 1.0
     lr_scheduler_type: str = "linear"
@@ -65,18 +75,20 @@ class TrainConfig:
     eval_steps: int = 500
     save_steps: int = 500
     logging_steps: int = 50
-    dev_subset_size: int = 500             # subsample dev for speed
-    max_new_tokens: int = 225              # cap generation to prevent hallucination loops
+    dev_subset_size: int = 500     # subsample dev for speed
+    max_new_tokens: int = 225      # cap generation to prevent hallucination loops
+    per_device_eval_batch: int = 16  # eval keeps no activations/grads -> can be larger than train batch
 
     # --- data ---
     min_audio_duration: float = 0.5
     max_audio_duration: float = 30.0
     removed_ids_file: Optional[str] = None  # for A1/A2: path to file listing IDs to remove
+    dataloader_num_workers: int = 0         # keep 0 on Windows
 
     # --- I/O ---
-    output_dir: str = ""                   # auto-generated if empty
+    output_dir: str = ""           # auto-generated if empty
     resume_from_checkpoint: Optional[str] = None
-    save_total_limit: int = 2              # keep at most 2 checkpoints
+    save_total_limit: int = 2      # keep at most 2 checkpoints
 
     def __post_init__(self):
         if not self.run_tag:
@@ -130,8 +142,8 @@ def print_env_info():
     if torch.cuda.is_available():
         print(f"CUDA version: {torch.version.cuda}")
         print(f"GPU: {torch.cuda.get_device_name(0)}")
-        vram = torch.cuda.get_device_properties(0).total_mem / (1024**3)
-        print(f"GPU memory: {vram:.1f} GB")
+        props = torch.cuda.get_device_properties(0)
+        total = getattr(props, "total_memory", None) or getattr(props, "total_mem", 0)
+        print(f"GPU memory: {total / (1024 ** 3):.1f} GB")
     print(f"Project root: {PROJECT_ROOT}")
     print(f"Data dir: {DATA_DIR}")
-

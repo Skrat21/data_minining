@@ -9,18 +9,31 @@ Supports all experimental arms:
   A3: CER percentile removal (optional)
 
 Usage:
-  python train.py --dataset cv --arm A0 --seed 42
-  python train.py --config runs/cv_A1_seed42/config.yaml
-  python train.py --dataset cv --arm A1 --removed-ids results/cv_flagged_ids.txt
-  python train.py --dataset cv --arm A2 --removed-ids results/cv_random_removed_seed0.txt --seed 0
+    python train.py --dataset cv --arm A0 --seed 42
+    python train.py --config runs/cv_A1_seed42/config.yaml
+    python train.py --dataset cv --arm A1 --removed-ids results/cv_flagged_ids.txt
+    python train.py --dataset cv --arm A2 --removed-ids results/cv_random_removed_seed0.txt --seed 0
+
+Changes vs. the original:
+  - works together with the FIXED WhisperDataCollator (end-of-text no longer
+    masked, no duplicated start token). A label sanity check runs before
+    training and stops with a clear error if the labels are malformed.
+  - KV cache: the saved model had config.use_cache=False (set for gradient
+    checkpointing), which makes every later generate() call extremely slow.
+    generation_config.use_cache stays True during training and
+    config.use_cache is restored to True before saving.
+  - dev-set evaluation uses its own (larger) batch size: cfg.per_device_eval_batch
+  - --freeze-encoder now actually freezes the encoder (it was parsed but ignored)
+  - gradient checkpointing uses use_reentrant=False (works with frozen encoder)
+  - compute_metrics no longer mutates the Trainer's arrays and tolerates -100
+    in the generated ids
 """
+
 from __future__ import annotations
 
 import argparse
 import gc
 import json
-import os
-import sys
 import time
 from pathlib import Path
 
@@ -28,14 +41,13 @@ from pathlib import Path
 # to fix BucketNotFoundError import error in newer huggingface_hub versions
 import hf_compat  # noqa: F401, flake8: noqa
 
-import torch
 import numpy as np
+import torch
 from transformers import (
     WhisperForConditionalGeneration,
     WhisperProcessor,
     Seq2SeqTrainer,
     Seq2SeqTrainingArguments,
-    EarlyStoppingCallback,
 )
 
 from config import TrainConfig, set_seed, print_env_info, RUNS_DIR
@@ -49,23 +61,46 @@ from evaluate_model import compute_wer_cer
 
 def compute_metrics_factory(processor: WhisperProcessor, cfg: TrainConfig):
     """Create a compute_metrics function for the Trainer."""
+    pad_id = processor.tokenizer.pad_token_id
 
     def compute_metrics(pred):
         pred_ids = pred.predictions
-        label_ids = pred.label_ids
+        if isinstance(pred_ids, tuple):
+            pred_ids = pred_ids[0]
 
-        # Replace -100 with pad token id
-        label_ids[label_ids == -100] = processor.tokenizer.pad_token_id
+        # Replace -100 with the pad token id (copies; the Trainer's arrays stay untouched)
+        pred_ids = np.where(pred_ids == -100, pad_id, pred_ids)
+        label_ids = np.where(pred.label_ids == -100, pad_id, pred.label_ids)
 
         # Decode predictions and references
         pred_str = processor.tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
         label_str = processor.tokenizer.batch_decode(label_ids, skip_special_tokens=True)
 
         # Compute WER/CER with normalization
-        metrics = compute_wer_cer(pred_str, label_str)
-        return metrics
+        return compute_wer_cer(pred_str, label_str)
 
     return compute_metrics
+
+
+def sanity_check_labels(dataset, collator, processor, n: int = 2):
+    """Fail early if the collator produces labels the model cannot learn to stop with."""
+    tok = processor.tokenizer
+    eot = tok.eos_token_id
+    sot = tok.convert_tokens_to_ids("<|startoftranscript|>")
+
+    batch = collator([dataset[i] for i in range(min(n, len(dataset)))])
+    for row in batch["labels"]:
+        ids = [t for t in row.tolist() if t != -100]
+        if not ids or ids[-1] != eot:
+            raise RuntimeError(
+                "Label sanity check FAILED: sequences do not end with <|endoftext|>. "
+                "The model would never learn to stop generating. Check data_loader.WhisperDataCollator.")
+        if ids[0] == sot:
+            raise RuntimeError(
+                "Label sanity check FAILED: labels still start with <|startoftranscript|> "
+                "(the decoder would see it twice).")
+    shown = tok.decode([t for t in batch["labels"][0].tolist() if t != -100], skip_special_tokens=False)
+    print(f"Label sanity check OK. Example labels: {shown!r}")
 
 
 def train(cfg: TrainConfig):
@@ -74,6 +109,7 @@ def train(cfg: TrainConfig):
     print(f"Training: {cfg.run_tag}")
     print("=" * 70)
     print_env_info()
+
     set_seed(cfg.seed)
 
     # Save config
@@ -92,19 +128,24 @@ def train(cfg: TrainConfig):
 
     # Enable gradient checkpointing to save memory
     if cfg.gradient_checkpointing:
-        model.config.use_cache = False  # incompatible with grad checkpointing
-        model.gradient_checkpointing_enable()
+        model.config.use_cache = False  # incompatible with grad checkpointing (training only)
+        try:
+            model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        except TypeError:  # older transformers
+            model.gradient_checkpointing_enable()
 
-    # Set generation config
+    # Set generation config (generation keeps the KV cache even while config.use_cache is False)
     model.generation_config.language = cfg.language
     model.generation_config.task = cfg.task
     model.generation_config.forced_decoder_ids = None
     model.generation_config.max_new_tokens = cfg.max_new_tokens
+    model.generation_config.use_cache = True
 
-    # Freeze the encoder to save memory (optional but helps on 4 GB VRAM)
-    # Uncomment the next 3 lines if you get OOM errors:
-    # model.freeze_encoder()
-    # print("Encoder frozen to save memory")
+    # Freeze the encoder to save memory (helps on 4 GB VRAM)
+    if cfg.freeze_encoder:
+        for p in model.model.encoder.parameters():
+            p.requires_grad = False
+        print("Encoder frozen to save memory")
 
     # Print model info
     total_params = sum(p.numel() for p in model.parameters())
@@ -119,18 +160,20 @@ def train(cfg: TrainConfig):
 
     # Data collator
     data_collator = WhisperDataCollator(processor)
+    sanity_check_labels(train_dataset, data_collator, processor)
 
     # Training arguments
     training_args = Seq2SeqTrainingArguments(
         output_dir=cfg.output_dir,
         per_device_train_batch_size=cfg.per_device_train_batch,
-        per_device_eval_batch_size=cfg.per_device_train_batch,
+        per_device_eval_batch_size=cfg.per_device_eval_batch,
         gradient_accumulation_steps=cfg.gradient_accumulation_steps,
         learning_rate=cfg.learning_rate,
         warmup_ratio=cfg.warmup_ratio,
         num_train_epochs=cfg.num_epochs,
         fp16=cfg.fp16 and torch.cuda.is_available(),
         gradient_checkpointing=cfg.gradient_checkpointing,
+        gradient_checkpointing_kwargs={"use_reentrant": False} if cfg.gradient_checkpointing else None,
         eval_strategy="steps",
         eval_steps=cfg.eval_steps,
         save_strategy="steps",
@@ -148,7 +191,7 @@ def train(cfg: TrainConfig):
         max_grad_norm=cfg.max_grad_norm,
         lr_scheduler_type=cfg.lr_scheduler_type,
         seed=cfg.seed,
-        dataloader_num_workers=0,  # keep at 0 on Windows
+        dataloader_num_workers=cfg.dataloader_num_workers,  # keep at 0 on Windows
         remove_unused_columns=False,
         label_names=["labels"],
         resume_from_checkpoint=cfg.resume_from_checkpoint,
@@ -177,7 +220,12 @@ def train(cfg: TrainConfig):
     with open(output_dir / "train_metrics.json", "w") as f:
         json.dump(metrics, f, indent=2)
 
-    # Save model (best checkpoint was already saved by Trainer)
+    # Restore the KV cache flags BEFORE saving, so evaluation / scoring of this
+    # model is not slowed down by use_cache=False.
+    trainer.model.config.use_cache = True
+    trainer.model.generation_config.use_cache = True
+
+    # Save model (best checkpoint was already loaded by the Trainer)
     trainer.save_model(str(output_dir / "best_model"))
     processor.save_pretrained(str(output_dir / "best_model"))
 
@@ -206,6 +254,7 @@ def main():
                         help="File of IDs to remove from training (for A1/A2)")
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--eval-batch-size", type=int, default=16)
     parser.add_argument("--grad-accum", type=int, default=4)
     parser.add_argument("--lr", type=float, default=1e-5)
     parser.add_argument("--eval-steps", type=int, default=500)
@@ -213,7 +262,6 @@ def main():
                         help="Resume from checkpoint path")
     parser.add_argument("--freeze-encoder", action="store_true",
                         help="Freeze encoder to save VRAM")
-
     args = parser.parse_args()
 
     if args.config:
@@ -227,11 +275,13 @@ def main():
             removed_ids_file=args.removed_ids,
             num_epochs=args.epochs,
             per_device_train_batch=args.batch_size,
+            per_device_eval_batch=args.eval_batch_size,
             gradient_accumulation_steps=args.grad_accum,
             learning_rate=args.lr,
             eval_steps=args.eval_steps,
             save_steps=args.eval_steps,
             resume_from_checkpoint=args.resume,
+            freeze_encoder=args.freeze_encoder,
         )
 
     train(cfg)
@@ -239,4 +289,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
