@@ -1,0 +1,23 @@
+# Large data directories (exclude actual content, keep structure)
+arabic_data/
+results/
+
+# Python
+__pycache__/
+*.pyc
+.pyc
+
+# Virtual environment
+.venv/
+
+# Phase 2 experiment outputs (regeneratable)
+eval_*.txt
+score_*.txt
+analyze_*.txt
+runs/
+
+# Whisper model caches (download on demand)
+.hf_cache/
+
+# Jupyter notebooks checkpoint
+.ipynb_checkpoints/
