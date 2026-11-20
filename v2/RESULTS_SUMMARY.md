@@ -46,23 +46,40 @@ A prior 100-step MGB-2 A0 speed check took 415.4 seconds of training:
 (microbatch 2 × accumulation 8). The current plan uses a fixed 8,000-clip,
 seed-123 subset (21.0682 audio hours), two epochs, and frozen encoder.
 This is about 1,000 A0 steps and 900 steps each for A1/A2. At the measured
-step time, the three runs project to about 3.23 hours of optimization, before
-evaluation, saving, startup, and checkpoint selection. This projection is
-not a completed end-to-end timing.
+step time, the three training runs were initially projected at about 3.23
+hours of optimization, before evaluation, saving, startup, and checkpoint
+selection.
 
-The approved full A0 run is in progress. At the latest recorded check it had
-reached step 284 of 1,000; the step-250 throughput callback reported
-4.180 seconds per step and 3.83 clip-presentations per second. It has not yet
-reached its first 400-step loss evaluation/checkpoint, so no final MGB-2
-training time or MGB-2 WER is available yet.
+The approved A0 run has now completed all 1,000 steps. Its training wall time
+was 4,300.6 seconds and total run wall time was 4,307.4 seconds (71.8
+minutes), or 4.30 seconds per step and 3.72 clip-presentations per second
+averaged across the run. The two 500-example loss-only DEV evaluations took
+60.9 and 55.5 seconds (1.94 minutes total); the recorded losses were 0.4056
+at step 400 and 0.3892 at step 800. Each scheduled interval also saved a
+checkpoint. The current checkpoints are 2.045 GiB each; the final model is
+0.902 GiB.
+
+Using this full-run wall time per step, 1,000 A0 steps plus 900 steps each
+for A1/A2 project to about 3.35 hours for the three training runs, including
+similar scheduled-evaluation/save overhead. This is an estimate, not a
+measured total; checkpoint selection and guard evaluation are additional.
+The estimated training total is below the ~4-hour target, but A1/A2 throughput
+has not yet been measured.
+
+No MGB-2 WER is available yet: A0 used loss-only validation, and DEV WER
+checkpoint selection has not been run. The A0 checkpoints remain intact;
+optimizer states have not been deleted.
 
 ## Interpretation
 
 - The measured WER reduction is from inference-time output-length control,
   not from a new trained model. Results are small and should be treated
   cautiously.
-- The new trainer removes generated-text evaluation from the training loop;
-  its total wall-time benefit will be measured after the approved A0 run.
+- The new trainer removes generated-text evaluation from the training loop.
+  The two loss-only evaluations took under two minutes combined, compared
+  with the previous 51–99 minutes per generation-based boundary. This
+  demonstrates much lower evaluation overhead, though it is not a controlled
+  same-settings benchmark.
 - Reducing the subset from 10,000 to 8,000 clips lowers the planned work, but
   does not improve per-step throughput.
 - MGB-2 A1 uses the worst 10% of the subset by A0 per-utterance WER. This is
