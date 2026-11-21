@@ -66,9 +66,17 @@ measured total; checkpoint selection and guard evaluation are additional.
 The estimated training total is below the ~4-hour target, but A1/A2 throughput
 has not yet been measured.
 
-No MGB-2 WER is available yet: A0 used loss-only validation, and DEV WER
-checkpoint selection has not been run. The A0 checkpoints remain intact;
-optimizer states have not been deleted.
+The approved DEV-only checkpoint comparison is complete (500 clips, seed
+123, raw greedy WER selection):
+
+| A0 checkpoint | DEV WER | DEV CER | Decode time |
+|---|---:|---:|---:|
+| Step 400 | 35.99% | 15.36% | 87.9 s |
+| Step 800 | 32.15% | 12.64% | 84.8 s |
+
+Step 800 is the best candidate by DEV WER; user approval is pending. This is
+not a test-set result. The A0 checkpoint files and optimizer states remain
+intact, and neither guard tuning nor MGB-2 test decoding has been run.
 
 ## Interpretation
 
