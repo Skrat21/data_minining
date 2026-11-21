@@ -74,9 +74,11 @@ The approved DEV-only checkpoint comparison is complete (500 clips, seed
 | Step 400 | 35.99% | 15.36% | 87.9 s |
 | Step 800 | 32.15% | 12.64% | 84.8 s |
 
-Step 800 is the best candidate by DEV WER; user approval is pending. This is
-not a test-set result. The A0 checkpoint files and optimizer states remain
-intact, and neither guard tuning nor MGB-2 test decoding has been run.
+Step 800 was approved as the A0 checkpoint. After approval, only the
+`optimizer.pt` files in A0's step-400 and step-800 checkpoints were removed
+(2,457,781,364 bytes total); free space changed from 21.42 to 23.71 GiB.
+The checkpoint weights and final model remain. This is not a test-set result;
+neither guard tuning nor MGB-2 test decoding has been run.
 
 ## Interpretation
 
