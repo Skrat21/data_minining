@@ -10,9 +10,9 @@ interval, and saves a final model. This targets evaluation overhead; it does
 not claim to make an individual optimizer step faster.
 
 The inference guard uses a duration-based generation cap:
-`ceil(9.4464 * audio_seconds + 16)`, clamped to 32–225 tokens. The cap was
-chosen on DEV only. N-gram blocking and loop trimming were also evaluated;
-they were not selected.
+`ceil(9.4464 * audio_seconds + 16)`, clamped to 32–225 tokens. The MGB-2
+A0 guard settings below were compared on the fixed 500-clip DEV subset
+(seed 123); no MGB-2 test data was used for guard selection.
 
 ## Common Voice test results
 
@@ -33,11 +33,11 @@ WER 0.00–0.66 pp / CER 0.13–0.95 pp. Positive values mean the cap reduced
 error. These are modest gains: the WER intervals include zero at the
 reported precision, and this guard did not eliminate looping outputs.
 
-On the DEV sweep, n-gram sizes 4 and 5 increased WER by 0.18 and 0.15 pp;
-size 6 and loop trimming tied raw WER. On TEST, the loop detector counted two
-looped outputs per model in both decoding modes; cap-hit counts were three
-for A0 and six for A1. Do not interpret the duration cap as a general loop
-fix.
+On the Common Voice DEV sweep, n-gram sizes 4 and 5 increased WER by 0.18
+and 0.15 pp; size 6 and loop trimming tied raw WER. On TEST, the loop
+detector counted two looped outputs per model in both decoding modes;
+cap-hit counts were three for A0 and six for A1. Do not interpret the
+duration cap as a general loop fix.
 
 ## Training throughput and current MGB-2 run
 
@@ -77,8 +77,48 @@ The approved DEV-only checkpoint comparison is complete (500 clips, seed
 Step 800 was approved as the A0 checkpoint. After approval, only the
 `optimizer.pt` files in A0's step-400 and step-800 checkpoints were removed
 (2,457,781,364 bytes total); free space changed from 21.42 to 23.71 GiB.
-The checkpoint weights and final model remain. This is not a test-set result;
-neither guard tuning nor MGB-2 test decoding has been run.
+The checkpoint weights and final model remain. This is not a test-set result.
+
+## MGB-2 A0 DEV guard sweep
+
+The five approved settings were run sequentially on the same 500 DEV clips.
+Raw WER/CER was 32.15%/12.64% for every setting. Clips/s is 500 divided by
+the corresponding raw or guarded decode time. Command wall time is the
+external measured duration, including process startup.
+
+| Setting | Guarded WER/CER | Cap hits raw/guarded | Loop flags raw/guarded | Guarded outputs changed vs raw | Decode seconds (clips/s), raw/guarded | Command wall (s) |
+|---|---:|---:|---:|---:|---:|---:|
+| Duration cap only | 30.11% / 11.42% | 2 / 2 | 4 / 4 | 3 | 89.07 (5.61) / 90.72 (5.51) | 186.847 |
+| Cap + no-repeat 4-gram | 30.49% / 11.34% | 2 / 0 | 4 / 0 | 80 | 92.60 (5.40) / 95.97 (5.21) | 194.390 |
+| Cap + no-repeat 5-gram | 29.96% / 11.16% | 2 / 0 | 4 / 0 | 49 | 93.96 (5.32) / 95.60 (5.23) | 195.162 |
+| Cap + no-repeat 6-gram | 29.57% / 11.06% | 2 / 0 | 4 / 0 | 26 | 94.80 (5.27) / 98.70 (5.07) | 199.314 |
+| Cap + loop trim | 29.70% / 11.41% | 2 / 2 | 4 / 4 | 5 | 96.35 (5.19) / 94.57 (5.29) | 196.584 |
+
+**Mechanical selection under the pre-agreed DEV rule: cap + loop trim.**
+No-repeat 6-gram had the lowest WER. Loop trim was 0.13 pp higher, within
+the 0.3 pp simplicity band, and was the simpler option. It also beat
+cap-only WER by 0.41 pp, so it does not meet the rule for rejection. The
+4-gram option is rejected because its WER is 0.38 pp higher than cap-only.
+This is a DEV-only recommendation, not a test-set conclusion.
+
+Four looped outputs were marked as trimmed. The loop-flag metric is computed
+on the generated text before post-hoc trimming, so the loop-trim setting
+reports four loop flags both before and after the guard. All five outputs
+changed by loop trim are identified below by utterance ID and behavior rather
+than reproducing dataset transcripts. The full raw and guarded rows remain in
+the local JSONL outputs. One example demonstrates that the heuristic can
+remove a legitimate repeated phrase, despite its lower aggregate DEV WER.
+
+- `mgb2_validation_0001360`: a hallucinated word loop was cut down to two
+  repetitions.
+- `mgb2_validation_0002271`: a long repeated number phrase was cut down to
+  two repetitions.
+- `mgb2_validation_0002643`: the reference has a phrase repeated three times;
+  the guard retained only two repetitions (a false positive).
+- `mgb2_validation_0002874`: a short repeated word sequence was trimmed before
+  the rest of the hypothesis.
+- `mgb2_validation_0002400`: no loop was detected; the cap changed one token
+  while otherwise leaving the output intact.
 
 ## Interpretation
 
@@ -94,4 +134,5 @@ neither guard tuning nor MGB-2 test decoding has been run.
   does not improve per-step throughput.
 - MGB-2 A1 uses the worst 10% of the subset by A0 per-utterance WER. This is
   different from Common Voice A1, which used WER >= 1.0.
-- No A1/A2 training or MGB-2 test decoding has started.
+- No A1/A2 training, training-data scoring, or MGB-2 test decoding has
+  started.
